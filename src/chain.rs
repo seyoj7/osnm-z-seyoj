@@ -16,7 +16,6 @@ use crate::{
 
 const RPC_RESPONSE_LIMIT: usize = 1024 * 1024;
 const RPC_CONTENT_LENGTH_LIMIT: u64 = 1024 * 1024;
-const WALLET_SNAPSHOT_MAX_ATTEMPTS: usize = 2;
 const EIP7702_PROBE_CALLDATA: &str = "0xc1cd7856";
 const EIP7702_PROBE_DELEGATE: &str = "0x1234567890abcdef1234567890abcdef12345678";
 const EIP7702_PROBE_ACCOUNT: &str = "0x000000000000000000000000000000000dead123";
@@ -256,21 +255,63 @@ impl ChainGateway {
         rpc_index: usize,
         wallet: Address,
     ) -> Result<WalletSnapshot, ChainError> {
-        for attempt in 1..=WALLET_SNAPSHOT_MAX_ATTEMPTS {
-            let (account_state, submission_inputs) = tokio::join!(
-                self.account_state(config, rpc_index, wallet),
-                self.submission_inputs(config, rpc_index, wallet)
-            );
-            let account_state = account_state?;
-            let submission_inputs = submission_inputs?;
-            match reconcile_wallet_snapshot(account_state, submission_inputs) {
-                Ok(snapshot) => return Ok(snapshot),
-                Err(error) if attempt == WALLET_SNAPSHOT_MAX_ATTEMPTS => return Err(error),
-                Err(ChainError::WalletSnapshotChanged) => {}
-                Err(error) => return Err(error),
-            }
+        let endpoint = endpoint(config, rpc_index)?;
+        let wallet_hex = wallet.to_checksum(None);
+        let requests = [
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_getBalance",
+                params: json!([wallet_hex, "pending"]),
+            },
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                id: 2,
+                method: "eth_getTransactionCount",
+                params: json!([wallet_hex, "pending"]),
+            },
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                id: 3,
+                method: "eth_getCode",
+                params: json!([wallet_hex, "latest"]),
+            },
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                id: 4,
+                method: "eth_getBlockByNumber",
+                params: json!(["latest", false]),
+            },
+            JsonRpcRequest {
+                jsonrpc: "2.0",
+                id: 5,
+                method: "eth_maxPriorityFeePerGas",
+                params: Value::Array(vec![]),
+            },
+        ];
+        let response = self
+            .client
+            .post(endpoint.clone())
+            .json(&requests)
+            .send()
+            .await
+            .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ChainError::RateLimited { index: rpc_index });
         }
-        unreachable!("bounded wallet snapshot loop always returns")
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > RPC_CONTENT_LENGTH_LIMIT)
+        {
+            return Err(ChainError::InvalidResponse { index: rpc_index });
+        }
+        let response_body = read_limited_body(response, RPC_RESPONSE_LIMIT)
+            .await
+            .map_err(|()| ChainError::InvalidResponse { index: rpc_index })?;
+        let envelope: Value = serde_json::from_slice(&response_body)
+            .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+        decode_wallet_snapshot_batch(&envelope, rpc_index)
     }
 
     pub async fn wait_for_account_code_hash(
@@ -420,18 +461,84 @@ impl ChainGateway {
         let mut delay_ms = policy.initial_delay_ms.max(50);
         let mut received_response = false;
         let mut last_rate_limit = None;
+        let endpoint = endpoint(config, rpc_index)?;
         loop {
-            for (index, transaction_hash) in transaction_hashes.iter().enumerate() {
+            if transaction_hashes.len() == 1 {
+                // Fast path: single hash avoids batch overhead.
                 match self
-                    .transaction_receipt(config, rpc_index, *transaction_hash)
+                    .transaction_receipt(config, rpc_index, transaction_hashes[0])
                     .await
                 {
-                    Ok(Some(receipt)) => return Ok(Some((index, receipt))),
+                    Ok(Some(receipt)) => return Ok(Some((0, receipt))),
                     Ok(None) => received_response = true,
                     Err(error @ ChainError::RateLimited { .. }) => {
                         last_rate_limit = Some(error);
                     }
                     Err(error) => return Err(error),
+                }
+            } else {
+                // Batch path: fetch all receipts in one HTTP request.
+                let requests: Vec<JsonRpcRequest> = transaction_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, hash)| JsonRpcRequest {
+                        jsonrpc: "2.0",
+                        id: u64::try_from(i + 1).unwrap_or(1),
+                        method: "eth_getTransactionReceipt",
+                        params: json!([hash.to_string()]),
+                    })
+                    .collect();
+                let response = self
+                    .client
+                    .post(endpoint.clone())
+                    .json(&requests)
+                    .send()
+                    .await;
+                match response {
+                    Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        last_rate_limit = Some(ChainError::RateLimited { index: rpc_index });
+                    }
+                    Ok(resp) if resp.status().is_success() => {
+                        let body = read_limited_body(resp, RPC_RESPONSE_LIMIT)
+                            .await
+                            .map_err(|()| ChainError::InvalidResponse { index: rpc_index })?;
+                        let envelope: Value = serde_json::from_slice(&body)
+                            .map_err(|_| ChainError::InvalidResponse { index: rpc_index })?;
+                        if let Some(responses) = envelope.as_array() {
+                            for response_item in responses {
+                                let id = response_item
+                                    .get("id")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|id| id.checked_sub(1));
+                                let Some(hash_index) = id.and_then(|i| usize::try_from(i).ok())
+                                else {
+                                    continue;
+                                };
+                                if hash_index >= transaction_hashes.len() {
+                                    continue;
+                                }
+                                let result = response_item.get("result");
+                                if result.is_some_and(Value::is_null) || result.is_none() {
+                                    received_response = true;
+                                    continue;
+                                }
+                                if let Some(result) = result {
+                                    if let Ok(receipt) =
+                                        serde_json::from_value::<RpcReceipt>(result.clone())
+                                    {
+                                        let decoded = decode_receipt(
+                                            &receipt,
+                                            rpc_index,
+                                            transaction_hashes[hash_index],
+                                        )?;
+                                        return Ok(Some((hash_index, decoded)));
+                                    }
+                                }
+                                received_response = true;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             let now = Instant::now();
@@ -836,6 +943,103 @@ fn decode_account_state_batch(envelope: &Value, index: usize) -> Result<AccountS
     })
 }
 
+fn decode_wallet_snapshot_batch(
+    envelope: &Value,
+    index: usize,
+) -> Result<WalletSnapshot, ChainError> {
+    let responses = envelope
+        .as_array()
+        .filter(|responses| responses.len() == 5)
+        .ok_or(ChainError::BatchUnsupported { index })?;
+    let mut results: [Option<Value>; 5] = std::array::from_fn(|_| None);
+    for response in responses {
+        let id = response
+            .get("id")
+            .and_then(Value::as_u64)
+            .filter(|id| (1..=5).contains(id))
+            .ok_or(ChainError::BatchUnsupported { index })?;
+        let slot = usize::try_from(id - 1).map_err(|_| ChainError::InvalidResponse { index })?;
+        if results[slot].is_some() {
+            return Err(ChainError::BatchUnsupported { index });
+        }
+        results[slot] = Some(extract_result(response, index, id)?.clone());
+    }
+
+    // id=1: eth_getBalance
+    let balance: String = serde_json::from_value(
+        results[0]
+            .take()
+            .ok_or(ChainError::BatchUnsupported { index })?,
+    )
+    .map_err(|_| ChainError::InvalidResponse { index })?;
+    // id=2: eth_getTransactionCount
+    let pending_nonce: String = serde_json::from_value(
+        results[1]
+            .take()
+            .ok_or(ChainError::BatchUnsupported { index })?,
+    )
+    .map_err(|_| ChainError::InvalidResponse { index })?;
+    // id=3: eth_getCode
+    let code: String = serde_json::from_value(
+        results[2]
+            .take()
+            .ok_or(ChainError::BatchUnsupported { index })?,
+    )
+    .map_err(|_| ChainError::InvalidResponse { index })?;
+    // id=4: eth_getBlockByNumber
+    let block: RpcBlock = serde_json::from_value(
+        results[3]
+            .take()
+            .ok_or(ChainError::BatchUnsupported { index })?,
+    )
+    .map_err(|_| ChainError::InvalidResponse { index })?;
+    // id=5: eth_maxPriorityFeePerGas
+    let priority_fee: String = serde_json::from_value(
+        results[4]
+            .take()
+            .ok_or(ChainError::BatchUnsupported { index })?,
+    )
+    .map_err(|_| ChainError::InvalidResponse { index })?;
+
+    let pending_nonce =
+        parse_quantity_u64(&pending_nonce).map_err(|_| ChainError::InvalidResponse { index })?;
+    let timestamp =
+        parse_quantity_u64(&block.timestamp).map_err(|_| ChainError::InvalidResponse { index })?;
+    let base_fee_per_gas = block
+        .base_fee_per_gas
+        .as_deref()
+        .ok_or(ChainError::Eip1559Unavailable)
+        .and_then(|value| {
+            parse_quantity_u256(value).map_err(|_| ChainError::InvalidResponse { index })
+        })?;
+    let max_priority_fee_per_gas =
+        parse_quantity_u256(&priority_fee).map_err(|_| ChainError::InvalidResponse { index })?;
+    let max_fee_per_gas = base_fee_per_gas
+        .checked_mul(U256::from(2_u8))
+        .and_then(|value| value.checked_add(max_priority_fee_per_gas))
+        .ok_or(ChainError::QuantityOverflow)?;
+
+    Ok(WalletSnapshot {
+        account_state: AccountState {
+            balance: parse_quantity_u256(&balance)
+                .map_err(|_| ChainError::InvalidResponse { index })?,
+            pending_nonce,
+            code: decode_code(&code, index)?,
+        },
+        submission_inputs: SubmissionInputs {
+            latest_block: LatestBlock {
+                timestamp,
+                base_fee_per_gas: Some(base_fee_per_gas),
+            },
+            pending_nonce,
+            fee_estimate: FeeEstimate {
+                max_priority_fee_per_gas,
+                max_fee_per_gas,
+            },
+        },
+    })
+}
+
 fn decode_code(code: &str, index: usize) -> Result<Bytes, ChainError> {
     let digits = code
         .strip_prefix("0x")
@@ -924,6 +1128,7 @@ fn parse_quantity_u64(value: &str) -> Result<u64, std::num::ParseIntError> {
     u64::from_str_radix(digits, 16)
 }
 
+#[cfg(test)]
 fn reconcile_wallet_snapshot(
     account_state: AccountState,
     submission_inputs: SubmissionInputs,
@@ -951,9 +1156,10 @@ mod tests {
 
     use super::{
         AccountState, ChainError, FeeEstimate, LatestBlock, ReceiptPollingPolicy, RetryConfig,
-        RpcReceipt, SubmissionInputs, classify_capability_probe, decode_account_state_batch,
-        decode_receipt, decode_submission_batch, eip1153_probe_params, eip7702_probe_params,
-        extract_result, is_eip7702_probe_success, reconcile_wallet_snapshot,
+        RpcReceipt, SubmissionInputs, classify_capability_probe,
+        decode_account_state_batch, decode_receipt, decode_submission_batch,
+        decode_wallet_snapshot_batch, eip1153_probe_params, eip7702_probe_params, extract_result,
+        is_eip7702_probe_success, reconcile_wallet_snapshot,
     };
 
     #[test]
@@ -1188,5 +1394,31 @@ mod tests {
             ..receipt
         };
         assert!(decode_receipt(&invalid, 1, hash).is_err());
+    }
+
+    #[test]
+    fn decodes_unified_wallet_snapshot_batch_by_id() {
+        let envelope = serde_json::json!([
+            {"jsonrpc":"2.0","id":5,"result":"0xf4240"},
+            {"jsonrpc":"2.0","id":3,"result":"0x"},
+            {"jsonrpc":"2.0","id":1,"result":"0x123"},
+            {"jsonrpc":"2.0","id":4,"result":{"timestamp":"0x64","baseFeePerGas":"0x7a120"}},
+            {"jsonrpc":"2.0","id":2,"result":"0x7"}
+        ]);
+
+        let snapshot = decode_wallet_snapshot_batch(&envelope, 1).expect("snapshot");
+        assert_eq!(snapshot.account_state.balance, U256::from(0x123_u64));
+        assert_eq!(snapshot.account_state.pending_nonce, 7);
+        assert_eq!(snapshot.account_state.code.len(), 0);
+        assert_eq!(snapshot.submission_inputs.latest_block.timestamp, 100);
+        assert_eq!(snapshot.submission_inputs.pending_nonce, 7);
+        assert_eq!(
+            snapshot.submission_inputs.fee_estimate.max_priority_fee_per_gas,
+            U256::from(1_000_000_u64)
+        );
+        assert_eq!(
+            snapshot.submission_inputs.fee_estimate.max_fee_per_gas,
+            U256::from(2_000_000_u64)
+        );
     }
 }

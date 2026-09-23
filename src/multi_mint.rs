@@ -1465,9 +1465,30 @@ async fn execute_self_funded_wallet(
         token_id_number,
         wallet.wallet.entry.quantity(),
     )?;
-    for asset in assets {
-        let inputs = gateway.submission_inputs(chain, rpc_index, address).await?;
-        let fees = initial_transaction_fees(config.fees, inputs.fee_estimate)?;
+    for (transfer_index, asset) in assets.into_iter().enumerate() {
+        let transfer_nonce = wallet
+            .wallet
+            .account_state
+            .pending_nonce
+            .checked_add(1)
+            .and_then(|n| n.checked_add(u64::try_from(transfer_index).ok()?))
+            .ok_or(MultiMintError::ArithmeticOverflow)?;
+        let latest = gateway.latest_block(chain, rpc_index).await?;
+        let base_fee = latest
+            .base_fee_per_gas
+            .ok_or(ChainError::Eip1559Unavailable)?;
+        let priority_fee = wallet.fees.max_priority_fee_per_gas;
+        let max_fee = base_fee
+            .checked_mul(U256::from(2_u8))
+            .and_then(|v| v.checked_add(priority_fee))
+            .ok_or(MultiMintError::ArithmeticOverflow)?;
+        let fees = initial_transaction_fees(
+            config.fees,
+            FeeEstimate {
+                max_priority_fee_per_gas: priority_fee,
+                max_fee_per_gas: max_fee,
+            },
+        )?;
         let calldata = encode_safe_transfer(&asset, address, recipient);
         let transfer_receipt = submit_eip1559_with_replacements(
             config,
@@ -1475,7 +1496,7 @@ async fn execute_self_funded_wallet(
             chain,
             rpc_index,
             wallet.wallet.entry.signer(),
-            inputs.pending_nonce,
+            transfer_nonce,
             metadata.address,
             U256::ZERO,
             calldata,

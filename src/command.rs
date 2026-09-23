@@ -1705,6 +1705,24 @@ async fn execute_mint(mut context: MintExecutionContext<'_>) -> Result<(), Comma
 
     let hot_at_ms = schedule_deadline_millis(context.phase.starts_at(), CALLDATA_HOT_LEAD_MS)?;
     if context.is_scheduled {
+        // Warm the HTTP/2 connection ~5 seconds before the calldata hot path so that
+        // TLS handshake and ALPN negotiation latency is not paid on the critical path.
+        let warmup_lead_ms = CALLDATA_HOT_LEAD_MS.saturating_add(5_000);
+        let warmup_at_ms =
+            schedule_deadline_millis(context.phase.starts_at(), warmup_lead_ms)?;
+        logging::animate(
+            format!(
+                "Waiting for stage {} connection warmup",
+                context.selected_stage.stage_index
+            ),
+            wait_until_unix_millis(warmup_at_ms),
+        )
+        .await;
+        // Lightweight metadata fetch to keep the OpenSea connection alive.
+        let _ = context
+            .client
+            .collection_metadata(&context.metadata.slug)
+            .await;
         logging::animate(
             format!(
                 "Waiting for stage {} calldata hot path",

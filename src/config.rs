@@ -921,14 +921,14 @@ mod tests {
         assert_eq!(loaded.app.gas_limit, 300_000);
         assert_eq!(loaded.app.scheduling.refresh_interval_seconds, 600);
         assert_eq!(loaded.app.retry.max_attempts, 3);
-        assert_eq!(loaded.app.retry.pending_timeout_seconds, 20);
-        assert_eq!(loaded.app.retry.base_delay_ms, 250);
-        assert_eq!(loaded.app.retry.max_delay_ms, 2_000);
+        assert_eq!(loaded.app.retry.pending_timeout_seconds, 12);
+        assert_eq!(loaded.app.retry.base_delay_ms, 100);
+        assert_eq!(loaded.app.retry.max_delay_ms, 500);
         assert_eq!(loaded.app.fees.replacement_bump_bps, 11_250);
-        assert_eq!(loaded.app.opensea.request_timeout_ms, 10_000);
-        assert_eq!(loaded.app.opensea.eligibility_request_timeout_ms, 5_000);
+        assert_eq!(loaded.app.opensea.request_timeout_ms, 5_000);
+        assert_eq!(loaded.app.opensea.eligibility_request_timeout_ms, 3_000);
         assert_eq!(loaded.app.opensea.max_attempts, 3);
-        assert_eq!(loaded.app.opensea.retry_interval_ms, 250);
+        assert_eq!(loaded.app.opensea.retry_interval_ms, 100);
         assert_eq!(loaded.app.opensea.calldata_max_attempts, 40);
     }
 
